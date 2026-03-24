@@ -129,8 +129,7 @@ async def process_digest_input(message: Message, state: FSMContext):
             chat_id=status_msg.chat.id,
             message_id=status_msg.message_id
         )
-        # filter_by_topic — синхронная (локальные эмбеддинги, без API)
-        relevant = filter_by_topic(raw_messages, topic)
+        relevant = await filter_by_topic(raw_messages, topic)
 
         if not relevant:
             await status_msg.edit_text(

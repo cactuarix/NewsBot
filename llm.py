@@ -1,18 +1,17 @@
 """
-llm.py — фильтрация и суммаризация новостей.
+llm.py — фильтрация и суммаризация новостей через Google Gemini.
 
 Пайплайн:
-  1. filter_by_topic()  — локальная фильтрация через эмбеддинги (без API, бесплатно)
-  2. summarize()        — суммаризация через Google Gemini (250 запросов/день бесплатно)
+  1. filter_by_topic()  — фильтрация через Gemini (точная, понимает контекст и синонимы)
+  2. summarize()        — суммаризация через Gemini (1-2 предложения на новость)
 
-Фильтрация:
-  Используем sentence-transformers с моделью paraphrase-multilingual-MiniLM-L12-v2.
-  Модель ~120 МБ, скачивается один раз при первом запуске, работает локально.
-  Поддерживает русский язык, понимает семантику (не просто ключевые слова).
+Почему Gemini справится с большим объёмом:
+  Gemini 2.5 Flash поддерживает контекстное окно 1 048 576 токенов.
+  100 новостей по 200 символов ≈ 20 000 токенов — это ~2% от лимита.
+  Весь список новостей за день влезает в ОДИН запрос без батчей.
 
-Суммаризация:
-  Gemini 2.5 Flash — быстрый, бесплатный тариф.
-  Ключ: https://aistudio.google.com/apikey (только Google-аккаунт, без карты)
+Бесплатный тариф: 10 RPM / 250 запросов в день.
+Ключ: https://aistudio.google.com/apikey (только Google-аккаунт, без карты)
 """
 
 import json
@@ -21,7 +20,6 @@ import logging
 import os
 from dotenv import load_dotenv
 import google.generativeai as genai
-from sentence_transformers import SentenceTransformer, util
 
 load_dotenv()
 
@@ -32,33 +30,18 @@ logger = logging.getLogger(__name__)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
 
-# gemini-2.5-flash — лучший выбор для бесплатного тарифа:
-# быстрый, умный, 250 запросов/день бесплатно
 MODEL_NAME = "gemini-2.5-flash"
 
-SUMMARY_CONFIG = genai.types.GenerationConfig(temperature=0.3)
+FILTER_CONFIG = genai.types.GenerationConfig(temperature=0.0)   # детерминизм для фильтра
+SUMMARY_CONFIG = genai.types.GenerationConfig(temperature=0.3)  # чуть живее для суммари
 
 gemini = genai.GenerativeModel(MODEL_NAME)
 
-BATCH_SIZE = 15
-
-# Бесплатный тариф: 10 RPM = 1 запрос / 6 сек → ставим 7 сек с запасом
+# Бесплатный тариф: 10 RPM → пауза между запросами
 RATE_LIMIT_DELAY = 7.0
 
-# ─── Модель эмбеддингов (локальная) ──────────────────────────────────────────
-
-# Мультиязычная модель, поддерживает русский, ~120 МБ.
-# Скачивается один раз при первом запуске в ~/.cache/huggingface/
-EMBEDDING_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
-
-logger.info(f"Загружаю модель эмбеддингов {EMBEDDING_MODEL_NAME}...")
-embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-logger.info("Модель эмбеддингов загружена ✅")
-
-# Порог схожести: 0.0 — 1.0.
-# 0.25 — достаточно мягко, ловит синонимы и косвенные упоминания.
-# Увеличь до 0.35-0.4 если слишком много нерелевантного.
-SIMILARITY_THRESHOLD = 0.5
+# Суммаризация: батчи по 20 новостей (фильтрация — всегда одним запросом)
+BATCH_SIZE = 20
 
 
 # ─── Вспомогательные функции ──────────────────────────────────────────────────
@@ -104,63 +87,71 @@ def _parse_json_response(raw: str) -> list | dict:
     return json.loads(cleaned)
 
 
-# ─── Шаг 1: Фильтрация (локальные эмбеддинги, без API) ──────────────────────
+# ─── Шаг 1: Фильтрация через Gemini ─────────────────────────────────────────
 
-def filter_by_topic(messages: list[dict], topic: str) -> list[dict]:
+async def filter_by_topic(messages: list[dict], topic: str) -> list[dict]:
     """
-    Фильтрует сообщения по теме через семантические эмбеддинги.
-    Работает локально — без интернета, без API-ключей, без лимитов.
+    Фильтрует сообщения по теме через Gemini — один запрос на весь список.
 
-    Как это работает:
-      1. Кодируем тему пользователя в вектор (эмбеддинг)
-      2. Кодируем каждое сообщение в вектор
-      3. Считаем косинусное сходство между темой и каждым сообщением
-      4. Оставляем сообщения с similarity >= SIMILARITY_THRESHOLD
+    Преимущества перед эмбеддингами:
+      - Понимает синонимы, контекст, косвенные упоминания
+      - Не требует настройки порога — модель сама решает что релевантно
+      - Огромный контекст (1M токенов) позволяет отправить все новости за день сразу
 
-    Косинусное сходство:
-      1.0 — одинаковые по смыслу
-      0.5 — похожие темы
-      0.25 — косвенная связь (наш порог)
-      0.0 — несвязанные тексты
+    Запрос считается дешёвым: отправляем только первые 300 символов каждого поста,
+    получаем обратно только массив id — минимум выходных токенов.
 
     Args:
         messages: список сообщений из crawler.fetch_messages()
         topic:    тема пользователя (например, "искусственный интеллект")
 
     Returns:
-        Отфильтрованный список, отсортированный по релевантности (самые похожие — первыми)
+        Отфильтрованный список в исходном порядке
     """
     if not messages:
         return []
 
-    # Берём первые 300 символов текста — достаточно для определения темы,
-    # не тратим лишнее время на кодирование длинных постов
-    texts = [m["text"][:300] for m in messages]
-
-    # encode() — синхронный, но быстрый (~1 сек на 100 новостей на CPU)
-    # show_progress_bar=False чтобы не засорять логи бота
-    topic_emb = embedding_model.encode(topic, convert_to_tensor=True, show_progress_bar=False)
-    texts_emb = embedding_model.encode(texts, convert_to_tensor=True, show_progress_bar=False)
-
-    # cos_sim возвращает матрицу [1 x N], берём первую строку → тензор длины N
-    scores = util.cos_sim(topic_emb, texts_emb)[0]
-
-    # Собираем пары (сообщение, score) и фильтруем по порогу
-    scored = [
-        (msg, float(score))
-        for msg, score in zip(messages, scores)
-        if float(score) >= SIMILARITY_THRESHOLD
+    # Отправляем только id + первые 300 символов — экономим токены
+    items = [
+        {"id": m["id"], "text": m["text"][:300]}
+        for m in messages
     ]
 
-    # Сортируем по убыванию релевантности — самые похожие идут в дайджест первыми
-    scored.sort(key=lambda x: x[1], reverse=True)
+    prompt = f"""Ты — фильтр новостей. Пользователь ищет новости по теме: "{topic}".
 
-    filtered = [msg for msg, _ in scored]
-    logger.info(
-        f"filter_by_topic: {len(messages)} → {len(filtered)} сообщений "
-        f"(порог={SIMILARITY_THRESHOLD})"
-    )
-    return filtered
+Вот список новостей в формате JSON:
+{json.dumps(items, ensure_ascii=False, indent=2)}
+
+Задача: верни JSON-массив id новостей, которые относятся к теме "{topic}".
+Включай новости, которые хотя бы косвенно связаны с темой.
+Исключай только те, что явно про другое.
+
+Формат ответа — строго JSON-массив чисел, без пояснений:
+[12345, 12346, 12350]
+
+Если ничего не подходит — верни пустой массив: []"""
+
+    try:
+        raw = await _generate(prompt, FILTER_CONFIG)
+        parsed = _parse_json_response(raw)
+
+        if isinstance(parsed, list):
+            relevant_ids = set(parsed)
+        elif isinstance(parsed, dict):
+            # На случай если Gemini обернул в {"ids": [...]}
+            relevant_ids = set(next(iter(parsed.values())))
+        else:
+            return messages  # fallback: не теряем данные
+
+        filtered = [m for m in messages if m["id"] in relevant_ids]
+        logger.info(f"filter_by_topic: {len(messages)} → {len(filtered)} сообщений")
+
+        await asyncio.sleep(RATE_LIMIT_DELAY)  # пауза перед следующим запросом
+        return filtered
+
+    except Exception as e:
+        logger.error(f"filter_by_topic упал: {e}, возвращаю все сообщения")
+        return messages  # fallback: лучше показать лишнее, чем потерять нужное
 
 
 # ─── Шаг 2: Суммаризация ─────────────────────────────────────────────────────
@@ -168,7 +159,7 @@ def filter_by_topic(messages: list[dict], topic: str) -> list[dict]:
 async def summarize(messages: list[dict], topic: str) -> list[dict]:
     """
     Делает 1-2 предложения на каждую новость.
-    Батчи по BATCH_SIZE с паузой между ними (соблюдение rate limit).
+    Батчи по BATCH_SIZE с паузой между ними (соблюдение rate limit 10 RPM).
     """
     if not messages:
         return []
