@@ -2,3 +2,4 @@
 digest_session.session
 news_bot_venv/
 __pycache__/
+digest.db

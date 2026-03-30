@@ -20,15 +20,16 @@ API_HASH = os.getenv("TELEGRAM_API_HASH")
 PHONE = os.getenv("TELEGRAM_PHONE")
 
 # Клиент — один на всё приложение, переиспользуется
-_client: TelegramClient | None = None
 
+_client = None
+_client_lock = asyncio.Lock()
 
-async def get_client() -> TelegramClient:
-    """Возвращает (и при необходимости создаёт) Telethon-клиент."""
+async def get_client():
     global _client
-    if _client is None or not _client.is_connected():
-        _client = TelegramClient("digest_session", API_ID, API_HASH)
-        await _client.start(phone=PHONE)
+    async with _client_lock:  # только один корутин инициализирует клиент
+        if _client is None or not _client.is_connected():
+            _client = TelegramClient("digest_session", API_ID, API_HASH)
+            await _client.start(phone=PHONE)
     return _client
 
 
